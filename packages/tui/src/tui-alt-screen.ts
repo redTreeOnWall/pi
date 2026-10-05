@@ -54,6 +54,7 @@ import {
 	getOsc8LinkAtColumn,
 	getWordSegmenter,
 	sliceByColumn,
+	stripSoftWrapMarker,
 	stripTerminalSequences,
 	truncateToWidth,
 	visibleWidth,
@@ -402,8 +403,12 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		} else {
 			const width = Math.max(1, this.terminal.columns);
 			const documentLines = this.render(width).map((line) => line.replace(OSC133_ZONE_PREFIX, ""));
-			this.lastDocument = this.applyLineResets(documentLines.map((line) => line.replaceAll(CURSOR_MARKER, ""))).map(
-				(line) => (isImageLine(line) || visibleWidth(line) <= width ? line : sliceByColumn(line, 0, width, true)),
+			// Fullscreen renders row by row with autowrap disabled, so soft wrap markers must not
+			// reach the terminal; they only exist for the main screen's autowrap joins.
+			this.lastDocument = this.applyLineResets(
+				documentLines.map((line) => stripSoftWrapMarker(line.replaceAll(CURSOR_MARKER, ""))),
+			).map((line) =>
+				isImageLine(line) || visibleWidth(line) <= width ? line : sliceByColumn(line, 0, width, true),
 			);
 			let buffer = `${BEGIN_SYNCHRONIZED_OUTPUT}${EXIT_ALT_SCREEN}${DISABLE_AUTOWRAP}`;
 			for (let row = 0; row < this.lastDocument.length; row++) {
@@ -1688,8 +1693,9 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 
 		const cursorPos = this.extractCursorPosition(screen, height);
 		screen = this.applyLineResets(screen).map((line) => {
-			if (isImageLine(line) || visibleWidth(line) <= width) return line;
-			return sliceByColumn(line, 0, width, true);
+			if (isImageLine(line)) return line;
+			const withoutMarkers = stripSoftWrapMarker(line);
+			return visibleWidth(withoutMarkers) <= width ? withoutMarkers : sliceByColumn(withoutMarkers, 0, width, true);
 		});
 
 		const fullRedraw =

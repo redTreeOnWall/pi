@@ -113,6 +113,9 @@ export class AssistantMessageComponent extends Container {
 				this.contentContainer.addChild(
 					new Markdown(content.text.trim(), this.outputPad, 0, this.markdownTheme, undefined, {
 						transform: createMarkdownTransform("assistant", this.isStreaming, this.markdownTransformers),
+						// Let the terminal wrap the text so terminal copy and selection join the wrapped rows
+						// into one line, like `cat` output does.
+						softWrap: true,
 					}),
 				);
 			} else if (content.type === "thinking") {
@@ -158,6 +161,7 @@ export class AssistantMessageComponent extends Container {
 									this.isStreaming,
 									this.markdownTransformers,
 								),
+								softWrap: true,
 							},
 						);
 				this.contentContainer.addChild(

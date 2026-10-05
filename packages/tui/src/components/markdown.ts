@@ -2,7 +2,7 @@ import { Marked, type Token, Tokenizer, type TokenizerExtension, type Tokens } f
 import { renderLatex } from "../latex.ts";
 import { getCapabilities, hyperlink, isImageLine } from "../terminal-image.ts";
 import type { Component } from "../tui.ts";
-import { applyBackgroundToLine, flattenLines, visibleWidth, wrapTextWithAnsi } from "../utils.ts";
+import { applyBackgroundToLine, flattenLines, hasSoftWrapMarker, visibleWidth, wrapTextWithAnsi } from "../utils.ts";
 
 const STRICT_STRIKETHROUGH_REGEX = /^(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/;
 
@@ -226,6 +226,12 @@ export interface MarkdownOptions {
 	transform?: (markdown: string, availableWidth: number) => string;
 	/** Render supported LaTeX math expressions as Unicode text (default: true). */
 	renderLatex?: boolean;
+	/**
+	 * Fill rows to exactly the available width and mark continuation rows so the terminal
+	 * autowraps them. Terminal copy and selection then join the continuation rows back into one
+	 * line. Only supported without horizontal padding, which would otherwise pad rows with spaces.
+	 */
+	softWrap?: boolean;
 }
 
 interface InlineStyleContext {
@@ -287,6 +293,10 @@ export class Markdown implements Component {
 		// Calculate available width for content (subtract horizontal padding)
 		const contentWidth = Math.max(1, width - this.paddingX * 2);
 		const text = this.options.transform?.(this.text, contentWidth) ?? this.text;
+		// Horizontal padding is written into the rows, so rows could not reach the terminal width.
+		// A background style pads rows too, which would put spaces into copied text.
+		const softWrap =
+			this.options.softWrap === true && this.paddingX === 0 && this.defaultTextStyle?.bgColor === undefined;
 
 		// Don't render anything if there's no actual text
 		if (!text || text.trim() === "") {
@@ -328,7 +338,7 @@ export class Markdown implements Component {
 			if (isImageLine(line)) {
 				wrappedLines.push(line);
 			} else {
-				for (const wrappedLine of wrapTextWithAnsi(line, contentWidth)) {
+				for (const wrappedLine of wrapTextWithAnsi(line, contentWidth, { softWrap })) {
 					wrappedLines.push(wrappedLine);
 				}
 			}
@@ -350,6 +360,10 @@ export class Markdown implements Component {
 
 			if (bgFn) {
 				contentLines.push(applyBackgroundToLine(lineWithMargins, width, bgFn));
+			} else if (softWrap && hasSoftWrapMarker(line)) {
+				// Do not pad soft-wrapped rows: the renderer erases the cells after the short last row of
+				// a paragraph, and padding would put spaces into the text copied from the terminal.
+				contentLines.push(lineWithMargins);
 			} else {
 				// No background - just pad to width
 				const visibleLen = visibleWidth(lineWithMargins);

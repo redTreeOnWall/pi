@@ -878,6 +878,24 @@ function splitIntoTokensWithAnsi(text: string): string[] {
 }
 
 /**
+ * Zero-width APC sequence (ST-terminated: BEL is swallowed by tmux) that marks a row as a
+ * continuation of the row above it. The renderer must then write that row contiguously so the
+ * terminal autowraps into it, which lets terminal copy/selection tools join the row back into one
+ * line. It is invisible to `visibleWidth` and stripped right before writing to the terminal.
+ */
+export const SOFT_WRAP_MARKER = "\x1b_pi:w\x1b\\";
+
+/** True when `line` continues the row above it as part of one soft-wrapped paragraph. */
+export function hasSoftWrapMarker(line: string): boolean {
+	return line.includes(SOFT_WRAP_MARKER);
+}
+
+/** Remove soft wrap markers from a line. */
+export function stripSoftWrapMarker(line: string): string {
+	return line.includes(SOFT_WRAP_MARKER) ? line.replaceAll(SOFT_WRAP_MARKER, "") : line;
+}
+
+/**
  * Wrap text with ANSI codes preserved.
  *
  * ONLY does word wrapping - NO padding, NO background colors.
@@ -886,6 +904,8 @@ function splitIntoTokensWithAnsi(text: string): string[] {
  *
  * @param text - Text to wrap (may contain ANSI codes and newlines)
  * @param width - Maximum visible width per line
+ * @param options - Wrap mode. `softWrap` fills rows to exactly `width` cells and marks every
+ *   continuation row with `SOFT_WRAP_MARKER` so the renderer lets the terminal do the line break.
  * @returns Array of wrapped lines (NOT padded to width)
  */
 /**
@@ -897,7 +917,12 @@ export function flattenLines(lines: readonly string[]): void {
 	for (const line of lines) Number(line);
 }
 
-export function wrapTextWithAnsi(text: string, width: number): string[] {
+export interface WrapTextOptions {
+	/** Fill rows to exactly `width` cells and mark continuation rows for terminal autowrap. */
+	softWrap?: boolean;
+}
+
+export function wrapTextWithAnsi(text: string, width: number, options?: WrapTextOptions): string[] {
 	if (!text) {
 		return [""];
 	}
@@ -907,13 +932,17 @@ export function wrapTextWithAnsi(text: string, width: number): string[] {
 	const inputLines = text.split(/\r\n|\r|\n/);
 	const result: string[] = [];
 	const tracker = new AnsiCodeTracker();
+	const softWrap = options?.softWrap === true;
 
 	for (const inputLine of inputLines) {
 		// Prepend active ANSI codes from previous lines (except for first line)
 		const prefix = result.length > 0 ? tracker.getActiveCodes() : "";
-		const wrappedLines = wrapSingleLine(prefix + inputLine, width);
-		for (const wrappedLine of wrappedLines) {
-			result.push(wrappedLine);
+		const wrappedLines = softWrap
+			? wrapSingleLineSoft(prefix + inputLine, width)
+			: wrapSingleLine(prefix + inputLine, width);
+		for (let i = 0; i < wrappedLines.length; i++) {
+			// Every row after the first continues the row above it in the terminal grid.
+			result.push(softWrap && i > 0 ? SOFT_WRAP_MARKER + wrappedLines[i]! : wrappedLines[i]!);
 		}
 		// Update tracker with codes from this line for next iteration
 		updateTrackerFromText(inputLine, tracker);
@@ -1017,6 +1046,35 @@ export function isWhitespaceChar(char: string): boolean {
  */
 export function isPunctuationChar(char: string): boolean {
 	return PUNCTUATION_REGEX.test(char);
+}
+
+/**
+ * Fill-wrap a single line so every row but the last is exactly `width` visible cells wide.
+ *
+ * The rows are meant to be written without any cursor movement in between so the terminal
+ * autowraps them itself; a screen-row-per-element mapping is preserved because each row consumes
+ * exactly one row of the terminal grid.
+ */
+function wrapSingleLineSoft(line: string, width: number): string[] {
+	if (!line) {
+		return [""];
+	}
+	if (visibleWidth(line) <= width) {
+		return [line];
+	}
+
+	const rows = breakLongWord(line, width, new AnsiCodeTracker());
+	// A wide grapheme that does not fit in the last cell of a row is moved to the next row, which
+	// would leave that row one cell short and stop the terminal from autowrapping. Pad it with a
+	// space so every row except the last is exactly `width` cells.
+	for (let i = 0; i < rows.length - 1; i++) {
+		const row = rows[i]!;
+		const rowWidth = visibleWidth(row);
+		if (rowWidth < width) {
+			rows[i] = row + " ".repeat(width - rowWidth);
+		}
+	}
+	return rows;
 }
 
 function breakLongWord(word: string, width: number, tracker: AnsiCodeTracker): string[] {

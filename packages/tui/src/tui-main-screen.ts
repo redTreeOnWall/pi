@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
 import { type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
-import { visibleWidth } from "./utils.ts";
+import { hasSoftWrapMarker, stripSoftWrapMarker, visibleWidth } from "./utils.ts";
 
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
 const MAX_RENDER_WRITE_CHARS = 1024 * 1024;
@@ -96,6 +96,19 @@ function parseKittyImageHeader(line: string): KittyImageHeader | undefined {
 		else if (key === "r") rows = numberValue;
 	}
 	return { ids, rows };
+}
+
+/**
+ * A row is written as a continuation of the row above it when it is marked as a soft-wrapped
+ * continuation and the row above it fills the whole terminal width, so the terminal autowraps into
+ * it. Writing those rows contiguously (no `\r\n`, no `\x1b[2K`) sets the terminal's wrapped flag,
+ * which is what lets copy and selection tools join the rows back into one line.
+ */
+function isSoftWrapContinuation(lines: string[], index: number, width: number): boolean {
+	if (index <= 0 || index >= lines.length) return false;
+	if (!hasSoftWrapMarker(lines[index]!)) return false;
+	const previous = lines[index - 1]!;
+	return !isImageLine(previous) && visibleWidth(previous) === width;
 }
 
 function extractKittyImageIds(line: string): number[] {
@@ -283,8 +296,9 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				output.append("\x1b[2J\x1b[H\x1b[3J"); // Clear screen, home, then clear scrollback
 			}
 			for (let i = 0; i < newLines.length; i++) {
-				if (i > 0) output.append("\r\n");
 				const line = newLines[i];
+				const continuation = isSoftWrapContinuation(newLines, i, width);
+				if (i > 0 && !continuation) output.append("\r\n");
 				const isImage = isImageLine(line);
 				const imageReservedRows = isImage ? this.getKittyImageReservedRows(newLines, i) : 1;
 				if (imageReservedRows > 1 && imageReservedRows <= height) {
@@ -297,7 +311,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 					i += imageReservedRows - 1;
 					continue;
 				}
-				output.append(line);
+				output.append(isImage ? line : stripSoftWrapMarker(line));
 			}
 			output.append("\x1b[?2026l"); // End synchronized output
 			output.flush();
@@ -385,6 +399,19 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			const expandedRange = this.expandChangedRangeForKittyImages(firstChanged, lastChanged, newLines);
 			firstChanged = expandedRange.firstChanged;
 			lastChanged = expandedRange.lastChanged;
+		}
+		// A soft-wrapped row stays joined to the row above it only while the terminal keeps its link
+		// between the two rows. Rewriting the rows contiguously re-establishes that link. When the
+		// first changed row is a continuation, start one row earlier and rewrite the row above it as
+		// well. Never back up above the previous viewport, which would force a scrollback-clearing
+		// redraw; the link already on screen is kept in that case because the loop overwrites
+		// continuation rows in place instead of clearing them.
+		if (
+			firstChanged > 0 &&
+			firstChanged - 1 >= prevViewportTop &&
+			isSoftWrapContinuation(newLines, firstChanged, width)
+		) {
+			firstChanged -= 1;
 		}
 		const appendStart = appendedLines && firstChanged === this.previousLines.length && firstChanged > 0;
 
@@ -488,8 +515,12 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		// This reduces flicker when only a single line changes (e.g., spinner animation)
 		const renderEnd = Math.min(lastChanged, newLines.length - 1);
 		for (let i = firstChanged; i <= renderEnd; i++) {
-			if (i > firstChanged) output.append("\r\n");
+			const continuation = isSoftWrapContinuation(newLines, i, width);
+			// A row that begins a group is written together with its continuation row below it.
+			const softGroup = continuation || isSoftWrapContinuation(newLines, i + 1, width);
+			if (i > firstChanged && !continuation) output.append("\r\n");
 			const line = newLines[i];
+			let eraseLineTail = false;
 			const isImage = isImageLine(line);
 			const imageReservedRows = isImage ? this.getKittyImageReservedRows(newLines, i, renderEnd) : 1;
 			if (imageReservedRows > 1) {
@@ -513,7 +544,17 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				continue;
 			}
 
-			output.append("\x1b[2K"); // Clear current line
+			// Keep the terminal's link between the rows of a soft-wrapped group. Clearing either row
+			// with `\x1b[2K` breaks the link that lets copy and selection join the rows, so the rows of
+			// a group are overwritten in place instead. Their content covers the full width, except for
+			// the short last row of a paragraph, whose remaining cells are erased with `\x1b[0K`;
+			// erasing to the end of the line keeps the link. Clearing the row is what removes the link,
+			// not the erase.
+			if (softGroup) {
+				if (!isImageLine(line) && visibleWidth(line) < width) eraseLineTail = true;
+			} else {
+				output.append("\x1b[2K"); // Clear current line
+			}
 			if (!isImage && visibleWidth(line) > width) {
 				// Log all lines to crash file for debugging
 				const crashLogPath = path.join(this.logDirectory ?? os.tmpdir(), "pi-tui-crash.log");
@@ -542,7 +583,12 @@ export class TuiMainScreen extends TuiBase implements TUI {
 				].join("\n");
 				throw new Error(errorMsg);
 			}
-			output.append(line);
+			if (isImage) {
+				output.append(line);
+			} else {
+				output.append(stripSoftWrapMarker(line));
+			}
+			if (eraseLineTail) output.append("\x1b[0K");
 		}
 
 		// Track where cursor ended up after rendering
